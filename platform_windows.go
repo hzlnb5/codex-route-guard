@@ -148,6 +148,7 @@ function Get-Family($p) {
   }
   if($path -match '\\OpenAI\.Codex_'){ return 'codex' }
   if($path -match '\\OpenAI\.ChatGPT_'){ return 'chatgpt' }
+  if($p.ProcessName -eq 'Codex'){ return 'codex' }
   return $null
 }
 $fresh=@(Get-Process ChatGPT,Codex -ErrorAction SilentlyContinue | ForEach-Object {
@@ -159,21 +160,17 @@ $fresh=@(Get-Process ChatGPT,Codex -ErrorAction SilentlyContinue | ForEach-Objec
   } catch {}
 } | Where-Object { $_.Family })
 if($fresh.Count -eq 0){ exit 3 }
-$families=@($fresh | Select-Object -ExpandProperty Family -Unique)
-if($families.Count -ne 1){ exit 7 }
-$family=$families[0]
+$anchor=$fresh | Sort-Object @{Expression={[math]::Abs($_.StartMs-$writeMs)}} | Select-Object -First 1
+$family=$anchor.Family
 $targets=@($fresh | Where-Object { $_.Family -eq $family })
 if($targets.Count -eq 0){ exit 6 }
-# Resolve one matching packaged-app restart target before terminating anything. If Windows
-# cannot prove package identity, or if multiple package identities match, fail closed.
 $entries=Get-StartApps
 if($family -eq 'codex') {
-  $matches=@($entries | Where-Object { $_.AppID -like 'OpenAI.Codex_*' })
+  $entry=$entries | Where-Object { $_.AppID -like 'OpenAI.Codex_*' -or $_.Name -like 'Codex*' } | Select-Object -First 1
 } else {
-  $matches=@($entries | Where-Object { $_.AppID -like 'OpenAI.ChatGPT*' })
+  $entry=$entries | Where-Object { $_.AppID -like 'OpenAI.ChatGPT*' -or $_.Name -like 'ChatGPT*' } | Select-Object -First 1
 }
-if($matches.Count -ne 1){ exit 5 }
-$entry=$matches[0]
+if(-not $entry){ exit 5 }
 $targets | ForEach-Object { Stop-Process -Id $_.Process.Id -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Milliseconds 250
 Start-Process -FilePath ('shell:AppsFolder\\'+$entry.AppID) -ErrorAction Stop | Out-Null

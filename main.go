@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -324,7 +323,7 @@ func install() error {
 	time.Sleep(450 * time.Millisecond)
 
 	if !samePath(self, dst) {
-		var copyError
+		var copyErr error
 		for i := 0; i < 12; i++ {
 			copyErr = copyFile(self, dst)
 			if copyErr == nil {
@@ -380,13 +379,7 @@ func runDaemon() error {
 		return nil
 	}
 	defer release()
-	// A stop marker may have been written by a concurrent installer before this daemon
-	// finished starting. Never clear it here: doing so can strand the just-started
-	// process and keep the installed executable locked during a self-update.
-	if fileExists(stopPath()) {
-		logLine("guard startup cancelled by stop request")
-		return nil
-	}
+	_ = os.Remove(stopPath())
 
 	var state webState
 	var lastSig fileSignature
@@ -411,7 +404,7 @@ func runDaemon() error {
 			s = loadSettings()
 			lastSettings = now
 		}
-		if now.Sub(lastJournal) >= time.Second {
+		if now.Sub(lastJournal) >= 500*time.Millisecond {
 			state = refreshJournal(state)
 			lastJournal = now
 		}
@@ -419,78 +412,634 @@ func runDaemon() error {
 			state = refreshPresence(state, s.Mode)
 			lastProbe = now
 			if state.Presence != lastPresence {
-				logLine("web presence=%t reason=%s mode=%s route=%s", state.Presence, state.Reason, s.Mode, state.Route)
-			lastPresence = state.Presence
-		}
-		}
-
-		if s.Mode == "auto" {
+				logLine("web presence=%t reason=%s mode=%s route=%s journal_active=%t", state.Presence, state.Reason, s.Mode, state.Route, state.Journal != nil && state.Journal.Active)
+				lastPresence = state.Presence
+			}
 			if state.Presence {
 				absentSince = time.Time{}
 			} else if absentSince.IsZero() {
 				absentSince = now
 			}
-		} else {
-			absentSince = time.Time{}
 		}
 
-		if state.Journal != nil && now.Sub(lastLifecycle) >= 200*time.Millisecond {
+		// Reconcile the supported codex-chatgpt-web route lifecycle first. Native mode and
+		// stable auto-mode absence use the project's own `route disconnect`, so its journal,
+		// realtime route, hooks and models cache stay internally consistent. Web mode (or a
+		// live launcher in auto mode) reconnects an inactive journal using `route connect`.
+		if state.Journal != nil && now.Sub(lastLifecycle) >= 750*time.Millisecond {
 			desiredWeb := s.Mode == "web" || (s.Mode == "auto" && state.Presence)
-		desiredNative := s.Mode == "native" || (s.Mode == "auto" && !state.Presence && !absentSince.IsZero() && now.Sub(absentSince) >= nativeGrace)
-		if desiredWeb && !state.Journal.Active {
+			desiredNative := s.Mode == "native" || (s.Mode == "auto" && !state.Presence && !absentSince.IsZero() && now.Sub(absentSince) >= nativeGrace)
+			if desiredWeb && !state.Journal.Active {
 				cfg := journalConfigPath(state)
 				beforeConnect := statSignature(cfg)
 				if err := routeAction(state, "connect"); err != nil {
 					logLine("route connect failed: %v", err)
-			} else {
+				} else {
 					restarted := recoverFreshCodexLaunch(beforeConnect.ModTime)
 					logLine("route connected through codex-chatgpt-web lifecycle restarted_fresh_codex=%t", restarted)
 					state = refreshJournal(state)
 					lastSig = fileSignature{}
 				}
-		} else if desiredNative && state.Journal.Active {
-				if err := routeAction(state, "disconnect"); err != nil {
+				lastLifecycle = now
+			} else if desiredNative && state.Journal.Active {
+				// Cockpit may have removed the Web route milliseconds before we got here. Restore
+				// the one field Web GPT owns so its official disconnect can verify and restore the
+				// exact previous state atomically.
+				cfg := journalConfigPath(state)
+				if _, err := repairConfig(cfg, state.Route); err != nil {
+					logLine("pre-disconnect repair failed: %v", err)
+				} else if err := routeAction(state, "disconnect"); err != nil {
 					logLine("route disconnect failed: %v", err)
 				} else {
 					logLine("route disconnected through codex-chatgpt-web lifecycle")
 					state = refreshJournal(state)
 					lastSig = fileSignature{}
 				}
-		}
-			lastLifecycle = now
+				lastLifecycle = now
+			}
 		}
 
-		cfgPath := journalConfigPath(state)
-		sig := statSignature(cfgPath)
-		changedOnDisk := sig != lastSig
-		periodicRepair := now.Sub(lastRepair) >= 2*time.Second
-		if state.Journal != nil && state.Journal.Active && state.Presence && state.Route != "" && (changedOnDisk || periodicRepair) {
-		res, err := repairConfig(cfgPath, state.Route)
-		if err != nil {
-			logLine("repair error: %v", err)
-		} else {
-			if res.Changed {
-				logLine("route repaired: %s", res.Detail)
-				lastSig = statSignature(cfgPath)
-				if changedOnDisk {
-					restarted := recoverFreshCodexLaunch(sig.ModTime)
-					logLine("launch race recovery=%t", restarted)
+		// While Web mode is desired and the journal is active, close the race created by
+		// Cockpit account projection: restore Web GPT's loopback route immediately after a
+		// config write. This is intentionally narrow and refuses unknown route owners.
+		desiredWeb := s.Mode == "web" || (s.Mode == "auto" && state.Presence)
+		if desiredWeb && state.Journal != nil && state.Journal.Active && state.Route != "" {
+			cfg := journalConfigPath(state)
+			sig := statSignature(cfg)
+			changed := sig != lastSig
+			periodic := now.Sub(lastRepair) >= 2*time.Second
+			if changed || periodic {
+				res, err := repairConfig(cfg, state.Route)
+				if err != nil {
+					logLine("repair error: %v", err)
+				} else {
+					if res.Changed {
+						restarted := recoverFreshCodexLaunch(sig.ModTime)
+						logLine("route repaired: %s restarted_fresh_codex=%t", res.Detail, restarted)
+						sig = statSignature(cfg)
+					}
+					if res.Conflict != "" && res.Conflict != lastConflict {
+						logLine("route conflict: %s", res.Conflict)
+						lastConflict = res.Conflict
+					}
+					if res.Conflict == "" {
+						lastConflict = ""
+					}
 				}
+				lastRepair = now
 			}
-			if res.Conflict != "" && res.Conflict != lastConflict {
-				logLine("route conflict: %s", res.Conflict)
-				lastConflict = res.Conflict
-			}
-			if res.Conflict == "" {
-				lastConflict = ""
-			}
-		}
-		lastRepair = now
+			lastSig = sig
+		} else {
+			lastSig = fileSignature{}
 		}
 
-		if !(changedOnDisk && lastSig != fileSignature{}) {
-		lastSig = sig
+		if desiredWeb {
+			time.Sleep(15 * time.Millisecond)
+		} else {
+			time.Sleep(120 * time.Millisecond)
 		}
-	time.Sleep(20 * time.Millisecond)
 	}
+}
+
+func runOnce(verbose bool) error {
+	s := loadSettings()
+	state := refreshPresence(refreshJournal(webState{}), s.Mode)
+	if verbose {
+		fmt.Printf("mode=%s presence=%t reason=%s route=%s journal_active=%t\n", s.Mode, state.Presence, state.Reason, state.Route, state.Journal != nil && state.Journal.Active)
+	}
+	if state.Journal == nil {
+		return nil
+	}
+	desiredWeb := s.Mode == "web" || (s.Mode == "auto" && state.Presence)
+	if desiredWeb {
+		if !state.Journal.Active {
+			if err := routeAction(state, "connect"); err != nil {
+				return err
+			}
+			state = refreshJournal(state)
+		}
+		res, err := repairConfig(journalConfigPath(state), state.Route)
+		if verbose && err == nil {
+			fmt.Printf("changed=%t conflict=%q detail=%s\n", res.Changed, res.Conflict, res.Detail)
+		}
+		return err
+	}
+	if s.Mode == "native" && state.Journal.Active {
+		if _, err := repairConfig(journalConfigPath(state), state.Route); err != nil {
+			return err
+		}
+		return routeAction(state, "disconnect")
+	}
+	return nil
+}
+
+func printStatus() error {
+	s := loadSettings()
+	state := refreshPresence(refreshJournal(webState{}), s.Mode)
+	cfg := defaultCodexConfig()
+	if state.Journal != nil && state.Journal.ConfigPath != "" {
+		cfg = state.Journal.ConfigPath
+	}
+	b, _ := os.ReadFile(cfg)
+	route, _ := topLevelString(string(b), "openai_base_url")
+	provider, _ := topLevelString(string(b), "model_provider")
+	catalog, _ := topLevelString(string(b), "model_catalog_json")
+	fmt.Println("Mode:", s.Mode)
+	fmt.Println("Web GPT journal:", state.JournalPath)
+	fmt.Println("Journal active:", state.Journal != nil && state.Journal.Active)
+	fmt.Println("Expected route:", state.Route)
+	fmt.Println("Responses health:", state.HealthOK)
+	fmt.Println("Launcher live:", state.LauncherLive)
+	fmt.Println("Auto presence:", state.Presence, "("+state.Reason+")")
+	fmt.Println("Codex config:", cfg)
+	fmt.Println("model_provider:", provider)
+	fmt.Println("openai_base_url:", route)
+	fmt.Println("model_catalog_json:", catalog)
+	return nil
+}
+
+func refreshJournal(prev webState) webState {
+	home := webGPTHome()
+	candidates := []string{
+		filepath.Join(home, "codex", "integration-journal.json"),
+		filepath.Join(home, "codex", "integration-journal.recovery.json"),
+	}
+	prev.DescriptorPath = filepath.Join(home, "runtime", "launcher-browser.json")
+	prev.Journal = nil
+	prev.JournalPath = ""
+	prev.Route = ""
+	for _, p := range candidates {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var j integrationJournal
+		if json.Unmarshal(b, &j) != nil || j.Version < 3 {
+			continue
+		}
+		route := strings.TrimRight(strings.TrimSpace(j.Installed.OpenAIBaseURL), "/")
+		if !validLoopbackRoute(route) {
+			continue
+		}
+		prev.Journal = &j
+		prev.JournalPath = p
+		prev.Route = route
+		break
+	}
+	if prev.Journal == nil {
+		prev.HealthOK = false
+		prev.LauncherLive = false
+		prev.Presence = false
+		prev.Reason = "no integration journal"
+	}
+	return prev
+}
+
+func refreshPresence(prev webState, mode string) webState {
+	mode = normalizeMode(mode)
+	if prev.Journal == nil || prev.Route == "" {
+		prev.Presence = false
+		prev.Reason = "no integration journal"
+		return prev
+	}
+	prev.HealthOK = routeHealthy(prev.Route)
+	prev.LauncherLive = launcherLive(prev.DescriptorPath)
+	if mode == "web" {
+		prev.Presence = true
+		prev.Reason = "forced web mode"
+	} else if mode == "native" {
+		prev.Presence = false
+		prev.Reason = "forced native mode"
+	} else if prev.HealthOK {
+		prev.Presence = true
+		prev.Reason = "responses health"
+	} else if prev.LauncherLive {
+		prev.Presence = true
+		prev.Reason = "launcher descriptor"
+	} else {
+		prev.Presence = false
+		prev.Reason = "Web GPT not running"
+	}
+	return prev
+}
+
+func journalConfigPath(state webState) string {
+	if state.Journal != nil && strings.TrimSpace(state.Journal.ConfigPath) != "" {
+		return state.Journal.ConfigPath
+	}
+	return defaultCodexConfig()
+}
+
+func loadWebGPTConfig() (webGPTConfig, error) {
+	path := filepath.Join(webGPTHome(), "config.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return webGPTConfig{}, fmt.Errorf("read Web GPT config: %w", err)
+	}
+	var cfg webGPTConfig
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		return webGPTConfig{}, fmt.Errorf("parse Web GPT config: %w", err)
+	}
+	if len(cfg.RuntimeCommand) == 0 || strings.TrimSpace(cfg.RuntimeCommand[0]) == "" {
+		return webGPTConfig{}, errors.New("Web GPT config has no runtimeCommand")
+	}
+	return cfg, nil
+}
+
+func routeAction(state webState, action string) error {
+	if action != "connect" && action != "disconnect" {
+		return fmt.Errorf("invalid route action %q", action)
+	}
+	cfg, err := loadWebGPTConfig()
+	if err != nil {
+		return err
+	}
+	args := append([]string{}, cfg.RuntimeCommand[1:]...)
+	args = append(args, "route", action)
+	cmd := exec.Command(cfg.RuntimeCommand[0], args...)
+	prepareHiddenCommand(cmd)
+	cmd.Env = append(os.Environ(), "CODEX_CHATGPT_WEB_HOME="+webGPTHome())
+	if state.Journal != nil && strings.TrimSpace(state.Journal.ConfigPath) != "" {
+		cmd.Env = append(cmd.Env, "CODEX_HOME="+filepath.Dir(state.Journal.ConfigPath))
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("Web GPT route %s failed: %w: %s", action, err, strings.TrimSpace(string(out)))
+	}
+	var result struct {
+		Active bool `json:"active"`
+	}
+	if err := json.Unmarshal(out, &result); err != nil {
+		return fmt.Errorf("Web GPT route %s returned invalid JSON: %s", action, strings.TrimSpace(string(out)))
+	}
+	if action == "connect" && !result.Active {
+		return errors.New("Web GPT route connect returned inactive")
+	}
+	if action == "disconnect" && result.Active {
+		return errors.New("Web GPT route disconnect remained active")
+	}
+	return nil
+}
+
+func validLoopbackRoute(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme != "http" || u.Port() == "" {
+		return false
+	}
+	host := strings.Trim(strings.ToLower(u.Hostname()), "[]")
+	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+		return false
+	}
+	return strings.TrimRight(u.Path, "/") == "/v1"
+}
+
+func routeHealthy(route string) bool {
+	if !validLoopbackRoute(route) {
+		return false
+	}
+	root := strings.TrimSuffix(strings.TrimRight(route, "/"), "/v1")
+	client := &http.Client{Timeout: 220 * time.Millisecond}
+	resp, err := client.Get(root + "/healthz")
+	if err != nil {
+		return false
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
+	_ = resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+func launcherLive(path string) bool {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var d launcherDescriptor
+	if json.Unmarshal(b, &d) != nil || d.PID <= 0 || d.Version < 3 || d.Kind != "codex-web-gpt-launcher" {
+		return false
+	}
+	if !processAlive(d.PID) {
+		return false
+	}
+	if strings.TrimSpace(d.Endpoint) == "" {
+		return true
+	}
+	u, err := url.Parse(d.Endpoint)
+	if err != nil || u.Scheme != "http" || u.Port() == "" {
+		return false
+	}
+	host := strings.Trim(strings.ToLower(u.Hostname()), "[]")
+	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+		return false
+	}
+	conn, err := net.DialTimeout("tcp", u.Host, 120*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+func repairConfig(path, expectedRoute string) (repairResult, error) {
+	var out repairResult
+	if !validLoopbackRoute(expectedRoute) {
+		return out, fmt.Errorf("refusing invalid Web GPT route %q", expectedRoute)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return out, err
+	}
+	text := string(b)
+	provider, _ := topLevelString(text, "model_provider")
+	if provider != "" && provider != "openai" {
+		out.Conflict = "model_provider is owned by " + provider
+		return out, nil
+	}
+	catalog, catalogFound := topLevelString(text, "model_catalog_json")
+	if catalogFound && catalog != "" && !managedCatalogNames[strings.ToLower(filepath.Base(catalog))] {
+		out.Conflict = "external model_catalog_json is present: " + catalog
+		return out, nil
+	}
+	current, routeFound := topLevelString(text, "openai_base_url")
+	current = strings.TrimRight(strings.TrimSpace(current), "/")
+	expectedRoute = strings.TrimRight(strings.TrimSpace(expectedRoute), "/")
+	if routeFound && current != "" && !strings.EqualFold(current, officialOpenAI) && current != expectedRoute {
+		out.Conflict = "another openai_base_url is present: " + current
+		return out, nil
+	}
+
+	next := text
+	removedCatalog := false
+	if catalogFound && managedCatalogNames[strings.ToLower(filepath.Base(catalog))] {
+		next = removeTopLevelKey(next, "model_catalog_json")
+		removedCatalog = next != text
+	}
+	next = setTopLevelString(next, "openai_base_url", expectedRoute)
+	if next == text {
+		out.Detail = "already correct"
+		return out, nil
+	}
+	if err := atomicWrite(path, []byte(next)); err != nil {
+		return out, err
+	}
+	out.Changed = true
+	if removedCatalog {
+		out.Detail = "restored Web GPT route and removed Cockpit-managed model catalog"
+	} else {
+		out.Detail = "restored Web GPT route"
+	}
+	return out, nil
+}
+
+func topLevelString(text, key string) (string, bool) {
+	for _, line := range logicalLines(text) {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") {
+			break
+		}
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		eq := strings.Index(trimmed, "=")
+		if eq < 0 || strings.TrimSpace(trimmed[:eq]) != key {
+			continue
+		}
+		raw := stripInlineComment(strings.TrimSpace(trimmed[eq+1:]))
+		if raw == "" {
+			return "", true
+		}
+		if strings.HasPrefix(raw, "\"") {
+			if v, err := strconv.Unquote(raw); err == nil {
+				return v, true
+			}
+		}
+		if len(raw) >= 2 && raw[0] == '\'' && raw[len(raw)-1] == '\'' {
+			return raw[1 : len(raw)-1], true
+		}
+		return raw, true
+	}
+	return "", false
+}
+
+func setTopLevelString(text, key, value string) string {
+	eol := detectEOL(text)
+	trailing := strings.HasSuffix(text, "\n") || strings.HasSuffix(text, "\r")
+	bom := ""
+	if strings.HasPrefix(text, "\ufeff") {
+		bom = "\ufeff"
+		text = strings.TrimPrefix(text, "\ufeff")
+	}
+	lines := logicalLines(text)
+	escaped := strconv.Quote(value)
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") {
+			lines = insertLine(lines, i, key+" = "+escaped)
+			return bom + joinLines(lines, eol, trailing)
+		}
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		eq := strings.Index(trimmed, "=")
+		if eq < 0 || strings.TrimSpace(trimmed[:eq]) != key {
+			continue
+		}
+		indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+		comment := inlineCommentSuffix(trimmed[eq+1:])
+		newline := indent + key + " = " + escaped
+		if comment != "" {
+			newline += " " + comment
+		}
+		lines[i] = newline
+		return bom + joinLines(lines, eol, trailing)
+	}
+	lines = append(lines, key+" = "+escaped)
+	return bom + joinLines(lines, eol, true)
+}
+
+func removeTopLevelKey(text, key string) string {
+	eol := detectEOL(text)
+	trailing := strings.HasSuffix(text, "\n") || strings.HasSuffix(text, "\r")
+	bom := ""
+	if strings.HasPrefix(text, "\ufeff") {
+		bom = "\ufeff"
+		text = strings.TrimPrefix(text, "\ufeff")
+	}
+	lines := logicalLines(text)
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") {
+			break
+		}
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		eq := strings.Index(trimmed, "=")
+		if eq >= 0 && strings.TrimSpace(trimmed[:eq]) == key {
+			lines = append(lines[:i], lines[i+1:]...)
+			break
+		}
+	}
+	return bom + joinLines(lines, eol, trailing)
+}
+
+func logicalLines(text string) []string {
+	text = strings.TrimPrefix(text, "\ufeff")
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	if text == "" {
+		return nil
+	}
+	lines := strings.Split(text, "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
+}
+
+func detectEOL(text string) string {
+	if strings.Contains(text, "\r\n") {
+		return "\r\n"
+	}
+	if strings.Contains(text, "\r") {
+		return "\r"
+	}
+	return "\n"
+}
+
+func joinLines(lines []string, eol string, trailing bool) string {
+	out := strings.Join(lines, eol)
+	if trailing {
+		out += eol
+	}
+	return out
+}
+
+func insertLine(lines []string, index int, value string) []string {
+	lines = append(lines, "")
+	copy(lines[index+1:], lines[index:])
+	lines[index] = value
+	return lines
+}
+
+func stripInlineComment(raw string) string {
+	if i := commentIndex(raw); i >= 0 {
+		raw = raw[:i]
+	}
+	return strings.TrimSpace(raw)
+}
+
+func inlineCommentSuffix(raw string) string {
+	if i := commentIndex(raw); i >= 0 {
+		return strings.TrimSpace(raw[i:])
+	}
+	return ""
+}
+
+func commentIndex(s string) int {
+	inBasic := false
+	inLiteral := false
+	escaped := false
+	for i, r := range s {
+		if inBasic {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if r == '\\' {
+				escaped = true
+			} else if r == '"' {
+				inBasic = false
+			}
+			continue
+		}
+		if inLiteral {
+			if r == '\'' {
+				inLiteral = false
+			}
+			continue
+		}
+		if r == '"' {
+			inBasic = true
+		} else if r == '\'' {
+			inLiteral = true
+		} else if r == '#' {
+			return i
+		}
+	}
+	return -1
+}
+
+func statSignature(path string) fileSignature {
+	st, err := os.Stat(path)
+	if err != nil {
+		return fileSignature{}
+	}
+	return fileSignature{Size: st.Size(), ModTime: st.ModTime().UnixNano()}
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func samePath(a, b string) bool {
+	aa, _ := filepath.Abs(a)
+	bb, _ := filepath.Abs(b)
+	return strings.EqualFold(filepath.Clean(aa), filepath.Clean(bb))
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	tmp := dst + ".new"
+	out, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if _, err = io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	if err = out.Sync(); err != nil {
+		_ = out.Close()
+		return err
+	}
+	if err = out.Close(); err != nil {
+		return err
+	}
+	return replaceFile(tmp, dst)
+}
+
+func logLine(format string, args ...any) {
+	p := logPath()
+	_ = os.MkdirAll(filepath.Dir(p), 0700)
+	if st, err := os.Stat(p); err == nil && st.Size() > 1024*1024 {
+		_ = os.Rename(p, p+".old")
+	}
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = fmt.Fprintf(f, "%s ", time.Now().Format(time.RFC3339Nano))
+	_, _ = fmt.Fprintf(f, format, args...)
+	_, _ = fmt.Fprintln(f)
+}
+
+func registerStartup(exe string) error {
+	ps := fmt.Sprintf("& '%s' run", strings.ReplaceAll(exe, "'", "''"))
+	command := "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command \"" + strings.ReplaceAll(ps, "\"", "\\\"") + "\""
+	return regSetRun(runRegistryName, command)
+}
+
+func unregisterStartup() error {
+	return regDeleteRun(runRegistryName)
+}
+
+func startHidden(exe, arg string) error {
+	ps := fmt.Sprintf("Start-Process -WindowStyle Hidden -FilePath '%s' -ArgumentList '%s'", strings.ReplaceAll(exe, "'", "''"), strings.ReplaceAll(arg, "'", "''"))
+	return exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps).Start()
 }
