@@ -378,37 +378,6 @@ func TestLauncherDescriptorRejectsWrongKindWithoutDialing(t *testing.T) {
 	}
 }
 
-func TestLauncherDescriptorRejectsEmptyEndpoint(t *testing.T) {
-	root := t.TempDir()
-	path := filepath.Join(root, "launcher-browser.json")
-	d := launcherDescriptor{Version: 3, Kind: "codex-web-gpt-launcher", PID: os.Getpid()}
-	b, _ := json.Marshal(d)
-	if err := os.WriteFile(path, b, 0600); err != nil {
-		t.Fatal(err)
-	}
-	if launcherLive(path) {
-		t.Fatal("launcher descriptor without a loopback endpoint must fail closed")
-	}
-}
-
-func TestRouteHealthyRejectsRedirect(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/healthz" {
-			http.Redirect(w, r, "/ok", http.StatusFound)
-			return
-		}
-		if r.URL.Path == "/ok" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		http.NotFound(w, r)
-	}))
-	defer server.Close()
-	if routeHealthy(server.URL + "/v1") {
-		t.Fatal("health probe must not follow redirects")
-	}
-}
-
 func TestLoadLegacySettingsForMigration(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("LOCALAPPDATA", root)

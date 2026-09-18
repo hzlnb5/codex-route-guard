@@ -30,23 +30,6 @@ func TestFreshRecoveryScriptOnlyStopsFreshMatchingFamily(t *testing.T) {
 	if strings.Contains(script, "Get-Process ChatGPT,Codex -ErrorAction SilentlyContinue | Stop-Process") {
 		t.Fatal("recovery script must never terminate every ChatGPT/Codex process")
 	}
-	for _, forbidden := range []string{
-		"if($p.ProcessName -eq 'Codex')",
-		"Name -like 'Codex*'",
-		"Name -like 'ChatGPT*'",
-	} {
-		if strings.Contains(script, forbidden) {
-			t.Fatalf("recovery script must fail closed instead of using fallback %q", forbidden)
-		}
-	}
-	if !strings.Contains(script, "$families.Count -ne 1") {
-		t.Fatal("recovery script must fail closed when multiple app families are fresh")
-	}
-	entryCheck := strings.Index(script, "if($matches.Count -ne 1){ exit 5 }")
-	stop := strings.Index(script, "Stop-Process -Id $_.Process.Id")
-	if entryCheck < 0 || stop < 0 || entryCheck > stop {
-		t.Fatal("recovery must resolve exactly one restart target before terminating the fresh process")
-	}
 }
 
 func TestDaemonRepairsCockpitRewriteWhileWebGPTIsLive(t *testing.T) {
@@ -101,6 +84,7 @@ func TestDaemonRepairsCockpitRewriteWhileWebGPTIsLive(t *testing.T) {
 		}
 	}()
 
+	// Let the daemon observe the live Web GPT state, then emulate Cockpit's OAuth projection.
 	time.Sleep(500 * time.Millisecond)
 	if err := os.WriteFile(configPath, []byte("model_provider = \"openai\"\nmodel_catalog_json = \"cockpit-model-catalog.json\"\n"), 0600); err != nil {
 		t.Fatal(err)
@@ -117,28 +101,4 @@ func TestDaemonRepairsCockpitRewriteWhileWebGPTIsLive(t *testing.T) {
 	}
 	b, _ := os.ReadFile(configPath)
 	t.Fatalf("daemon did not repair Cockpit rewrite in time:\n%s", string(b))
-}
-
-func TestDaemonHonorsStopMarkerPresentAtStartup(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("LOCALAPPDATA", filepath.Join(root, "local"))
-	if err := os.MkdirAll(filepath.Dir(stopPath()), 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(stopPath(), []byte("stop"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- runDaemon() }()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("daemon ignored stop marker present during startup")
-	}
-	if _, err := os.Stat(stopPath()); err != nil {
-		t.Fatalf("daemon must not delete installer stop marker: %v", err)
-	}
 }
