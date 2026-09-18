@@ -324,7 +324,7 @@ func install() error {
 	time.Sleep(450 * time.Millisecond)
 
 	if !samePath(self, dst) {
-		var copyError
+		var copyErr error
 		for i := 0; i < 12; i++ {
 			copyErr = copyFile(self, dst)
 			if copyErr == nil {
