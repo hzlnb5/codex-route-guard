@@ -420,8 +420,8 @@ func runDaemon() error {
 			lastProbe = now
 			if state.Presence != lastPresence {
 				logLine("web presence=%t reason=%s mode=%s route=%s", state.Presence, state.Reason, s.Mode, state.Route)
-			lastPresence = state.Presence
-		}
+				lastPresence = state.Presence
+			}
 		}
 
 		if s.Mode == "auto" {
@@ -436,19 +436,19 @@ func runDaemon() error {
 
 		if state.Journal != nil && now.Sub(lastLifecycle) >= 200*time.Millisecond {
 			desiredWeb := s.Mode == "web" || (s.Mode == "auto" && state.Presence)
-		desiredNative := s.Mode == "native" || (s.Mode == "auto" && !state.Presence && !absentSince.IsZero() && now.Sub(absentSince) >= nativeGrace)
-		if desiredWeb && !state.Journal.Active {
+			desiredNative := s.Mode == "native" || (s.Mode == "auto" && !state.Presence && !absentSince.IsZero() && now.Sub(absentSince) >= nativeGrace)
+			if desiredWeb && !state.Journal.Active {
 				cfg := journalConfigPath(state)
 				beforeConnect := statSignature(cfg)
 				if err := routeAction(state, "connect"); err != nil {
 					logLine("route connect failed: %v", err)
-			} else {
+				} else {
 					restarted := recoverFreshCodexLaunch(beforeConnect.ModTime)
 					logLine("route connected through codex-chatgpt-web lifecycle restarted_fresh_codex=%t", restarted)
 					state = refreshJournal(state)
 					lastSig = fileSignature{}
 				}
-		} else if desiredNative && state.Journal.Active {
+			} else if desiredNative && state.Journal.Active {
 				if err := routeAction(state, "disconnect"); err != nil {
 					logLine("route disconnect failed: %v", err)
 				} else {
@@ -456,7 +456,7 @@ func runDaemon() error {
 					state = refreshJournal(state)
 					lastSig = fileSignature{}
 				}
-		}
+			}
 			lastLifecycle = now
 		}
 
@@ -465,32 +465,32 @@ func runDaemon() error {
 		changedOnDisk := sig != lastSig
 		periodicRepair := now.Sub(lastRepair) >= 2*time.Second
 		if state.Journal != nil && state.Journal.Active && state.Presence && state.Route != "" && (changedOnDisk || periodicRepair) {
-		res, err := repairConfig(cfgPath, state.Route)
-		if err != nil {
-			logLine("repair error: %v", err)
-		} else {
-			if res.Changed {
-				logLine("route repaired: %s", res.Detail)
-				lastSig = statSignature(cfgPath)
-				if changedOnDisk {
-					restarted := recoverFreshCodexLaunch(sig.ModTime)
-					logLine("launch race recovery=%t", restarted)
+			res, err := repairConfig(cfgPath, state.Route)
+			if err != nil {
+				logLine("repair error: %v", err)
+			} else {
+				if res.Changed {
+					logLine("route repaired: %s", res.Detail)
+					lastSig = statSignature(cfgPath)
+					if changedOnDisk {
+						restarted := recoverFreshCodexLaunch(sig.ModTime)
+						logLine("launch race recovery=%t", restarted)
+					}
+				}
+				if res.Conflict != "" && res.Conflict != lastConflict {
+					logLine("route conflict: %s", res.Conflict)
+					lastConflict = res.Conflict
+				}
+				if res.Conflict == "" {
+					lastConflict = ""
 				}
 			}
-			if res.Conflict != "" && res.Conflict != lastConflict {
-				logLine("route conflict: %s", res.Conflict)
-				lastConflict = res.Conflict
-			}
-			if res.Conflict == "" {
-				lastConflict = ""
-			}
-		}
-		lastRepair = now
+			lastRepair = now
 		}
 
 		if !(changedOnDisk && lastSig != fileSignature{}) {
-		lastSig = sig
+			lastSig = sig
 		}
-	time.Sleep(20 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
 }
