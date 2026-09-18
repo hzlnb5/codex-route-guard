@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  portable:
+    name: Portable tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          cache: false
+
+      - name: Go format
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(gofmt -l *.go)"
+
+      - name: Test
+        run: go test ./... -count=1
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Cross-compile Windows tests
+        shell: bash
+        run: GOOS=windows GOARCH=amd64 go test -c -o /tmp/codex-route-guard-tests.exe .
+
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          cache: false
+
+      - name: Test
+        run: go test ./... -count=1
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Verify safety invariants
+        shell: pwsh
+        run: |
+          $main = Get-Content -Raw main.go
+          $win = Get-Content -Raw platform_windows.go
+          if (-not $main.Contains('recoverFreshCodexLaunch(beforeConnect.ModTime)')) {
+            throw "disconnected-route launch-race recovery is missing"
+          }
+          if (-not $main.Contains('d.Kind != "codex-web-gpt-launcher"')) {
+            throw "launcher descriptor hardening is missing"
+          }
+          if (-not $win.Contains('freshCodexRecoveryScript')) {
+            throw "fresh-process recovery is missing"
+          }
+          if ($win.Contains('Get-Process ChatGPT,Codex -ErrorAction SilentlyContinue | Stop-Process')) {
+            throw "unsafe broad ChatGPT/Codex termination is present"
+          }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $short = "${{ github.sha }}".Substring(0, 12)
+          go build -trimpath -ldflags="-s -w -X main.version=ci-$short" -o dist/codex-route-guard.exe .
+
+      - name: Binary smoke test
+        shell: pwsh
+        run: |
+          .\dist\codex-route-guard.exe help
+          .\dist\codex-route-guard.exe version
+          .\dist\codex-route-guard.exe status
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Copy-Item INSTALL.cmd dist/
+          Copy-Item STATUS.cmd dist/
+          Copy-Item UNINSTALL.cmd dist/
+          Copy-Item README.md dist/
+          Copy-Item README.zh-CN.md dist/
+          Copy-Item LICENSE dist/
+          $hash = (Get-FileHash -Algorithm SHA256 dist/codex-route-guard.exe).Hash.ToLowerInvariant()
+          "$hash  codex-route-guard.exe" | Set-Content -Encoding ascii dist/SHA256SUMS.txt
+          Compress-Archive -Force dist/* codex-route-guard-windows-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codex-route-guard-windows-x64
+          retention-days: 30
+          if-no-files-found: error
+          path: codex-route-guard-windows-x64.zip
