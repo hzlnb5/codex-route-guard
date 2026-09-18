@@ -1,0 +1,255 @@
+name: Bootstrap audited source
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/bootstrap-source.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+
+      - name: Materialize audited source
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .bootstrap
+          mkdir -p .bootstrap/source
+
+          curl -fsSL             https://raw.githubusercontent.com/hzlnb5/cockpit-tools/main/tools/codex-webgpt-guard/source.zip             -o .bootstrap/source.zip
+          curl -fsSL             https://raw.githubusercontent.com/hzlnb5/cockpit-tools/main/tools/codex-webgpt-guard/hardening-v2.patch             -o .bootstrap/hardening-v2.patch
+
+          unzip -q .bootstrap/source.zip -d .bootstrap/source
+          git apply --whitespace=nowarn --directory=.bootstrap/source -p2 .bootstrap/hardening-v2.patch
+
+          cp .bootstrap/source/main.go .
+          cp .bootstrap/source/main_test.go .
+          cp .bootstrap/source/platform_windows.go .
+          cp .bootstrap/source/platform_windows_test.go .
+          cp .bootstrap/source/platform_stub.go .
+          cp .bootstrap/source/go.mod .
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path("main.go")
+          s = p.read_text()
+
+          s = s.replace(
+              'appDirName       = "CodexWebGPTGuard"\n\trunRegistryName  = "CodexWebGPTGuard"',
+              'appDirName             = "CodexRouteGuard"\n\trunRegistryName        = "CodexRouteGuard"\n\tlegacyAppDirName       = "CodexWebGPTGuard"\n\tlegacyRunRegistryName  = "CodexWebGPTGuard"',
+          )
+          s = s.replace(
+              'usage: codex-webgpt-guard.exe mode auto|web|native',
+              'usage: codex-route-guard.exe mode auto|web|native',
+          )
+          s = s.replace('Codex WebGPT Guard:', 'Codex Route Guard:')
+          s = s.replace('fmt.Println("Codex WebGPT Guard")', 'fmt.Println("Codex Route Guard")')
+          s = s.replace(
+              'dst := filepath.Join(d, "codex-webgpt-guard.exe")',
+              'dst := filepath.Join(d, "codex-route-guard.exe")',
+          )
+
+          log_anchor = '''func logPath() string {
+            d, _ := appDir()
+            return filepath.Join(d, "guard.log")
+          }
+          '''
+          legacy_helpers = '''func logPath() string {
+            d, _ := appDir()
+            return filepath.Join(d, "guard.log")
+          }
+
+          func legacyAppDir() string {
+            base := strings.TrimSpace(os.Getenv("LOCALAPPDATA"))
+            if base == "" {
+              return ""
+            }
+            return filepath.Join(base, legacyAppDirName)
+          }
+
+          func legacySettingsPath() string {
+            d := legacyAppDir()
+            if d == "" {
+              return ""
+            }
+            return filepath.Join(d, "settings.json")
+          }
+
+          func legacyStopPath() string {
+            d := legacyAppDir()
+            if d == "" {
+              return ""
+            }
+            return filepath.Join(d, "stop.request")
+          }
+
+          func loadLegacySettings() (settings, bool) {
+            p := legacySettingsPath()
+            if p == "" {
+              return settings{}, false
+            }
+            b, err := os.ReadFile(p)
+            if err != nil {
+              return settings{}, false
+            }
+            var s settings
+            if json.Unmarshal(b, &s) != nil {
+              return settings{}, false
+            }
+            s.Mode = normalizeMode(s.Mode)
+            return s, true
+          }
+
+          func stopLegacyGuard() {
+            if runtime.GOOS != "windows" {
+              return
+            }
+            if p := legacyStopPath(); p != "" {
+              _ = os.MkdirAll(filepath.Dir(p), 0700)
+              _ = os.WriteFile(p, []byte(time.Now().Format(time.RFC3339Nano)), 0600)
+            }
+            _ = regDeleteRun(legacyRunRegistryName)
+          }
+          '''
+          if log_anchor not in s:
+              raise SystemExit("logPath transformation anchor missing")
+          s = s.replace(log_anchor, legacy_helpers)
+
+          install_anchor = '''func install() error {
+            if runtime.GOOS != "windows" {
+              return errors.New("install is Windows-only")
+            }
+          '''
+          install_replacement = '''func install() error {
+            if runtime.GOOS != "windows" {
+              return errors.New("install is Windows-only")
+            }
+
+            // Migrate the older CodexWebGPTGuard package if it is installed. The old daemon
+            // used a different install directory, startup value and mutex, so stop it before
+            // starting Codex Route Guard to avoid two reconcilers touching the same config.
+            stopLegacyGuard()
+            time.Sleep(500 * time.Millisecond)
+          '''
+          if install_anchor not in s:
+              raise SystemExit("install transformation anchor missing")
+          s = s.replace(install_anchor, install_replacement)
+
+          old_settings = '''  if _, err := os.Stat(settingsPath()); errors.Is(err, os.ErrNotExist) {
+            if err := saveSettings(settings{Mode: defaultMode}); err != nil {
+              return err
+            }
+          }
+          '''
+          new_settings = '''  if _, err := os.Stat(settingsPath()); errors.Is(err, os.ErrNotExist) {
+            initial := settings{Mode: defaultMode}
+            if legacy, ok := loadLegacySettings(); ok {
+              initial = legacy
+            }
+            if err := saveSettings(initial); err != nil {
+              return err
+            }
+          }
+          '''
+          if old_settings not in s:
+              raise SystemExit("settings migration anchor missing")
+          s = s.replace(old_settings, new_settings)
+
+          if 'var version = "dev"' not in s:
+              s = s.replace(
+                  'var managedCatalogNames = map[string]bool{',
+                  'var version = "dev"\n\nvar managedCatalogNames = map[string]bool{',
+              )
+
+          help_case = '''  case "help", "-h", "--help":
+            printHelp()
+            return
+          '''
+          version_case = '''  case "version", "--version", "-v":
+            fmt.Println(version)
+            return
+          case "help", "-h", "--help":
+            printHelp()
+            return
+          '''
+          if help_case not in s:
+              raise SystemExit("version command anchor missing")
+          s = s.replace(help_case, version_case)
+          s = s.replace(
+              'fmt.Println("  install        install for current user and enable autostart")',
+              'fmt.Println("  version        print build version")\n\tfmt.Println("  install        install for current user and enable autostart")',
+          )
+          p.write_text(s)
+
+          p = Path("platform_windows.go")
+          s = p.read_text().replace(
+              "Local\\\\CodexWebGPTGuard-v1",
+              "Local\\\\CodexRouteGuard-v1",
+          )
+          p.write_text(s)
+
+          p = Path("go.mod")
+          p.write_text(
+              p.read_text().replace(
+                  "module github.com/hzlnb5/codex-webgpt-guard",
+                  "module github.com/hzlnb5/codex-route-guard",
+              )
+          )
+
+          p = Path("main_test.go")
+          s = p.read_text()
+          if "TestLoadLegacySettingsForMigration" not in s:
+              s += '''
+          func TestLoadLegacySettingsForMigration(t *testing.T) {
+            root := t.TempDir()
+            t.Setenv("LOCALAPPDATA", root)
+            legacyDir := filepath.Join(root, legacyAppDirName)
+            if err := os.MkdirAll(legacyDir, 0700); err != nil {
+              t.Fatal(err)
+            }
+            if err := os.WriteFile(filepath.Join(legacyDir, "settings.json"), []byte(`{"mode":"web"}`), 0600); err != nil {
+              t.Fatal(err)
+            }
+            got, ok := loadLegacySettings()
+            if !ok || got.Mode != "web" {
+              t.Fatalf("legacy settings migration failed: ok=%t mode=%q", ok, got.Mode)
+            }
+          }
+          '''
+          p.write_text(s)
+          PY
+
+          gofmt -w *.go
+          go test ./... -count=1
+          go vet ./...
+          GOOS=windows GOARCH=amd64 go test -c -o .bootstrap/guard-windows-tests.exe .
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w -X main.version=bootstrap" -o .bootstrap/codex-route-guard.exe .
+
+          grep -q 'recoverFreshCodexLaunch(beforeConnect.ModTime)' main.go
+          grep -q 'd.Kind != "codex-web-gpt-launcher"' main.go
+          grep -q 'freshCodexRecoveryScript' platform_windows.go
+          ! grep -q 'Get-Process ChatGPT,Codex -ErrorAction SilentlyContinue | Stop-Process' platform_windows.go
+
+          rm -rf .bootstrap
+          rm .github/workflows/bootstrap-source.yml
+
+      - name: Commit materialized source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat: materialize audited Codex Route Guard source"
+          git push
